@@ -4,6 +4,7 @@ set -e
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
+LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
 REPO="antirez/deepseek-v4-gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
@@ -28,6 +29,7 @@ case "$OUT_DIR" in
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
 TOKEN=${HF_TOKEN:-}
+HF_REVISION=
 
 usage() {
     cat <<EOF
@@ -108,7 +110,7 @@ Targets:
 
   laguna-q4
        Official imatrix-quantized Laguna S 2.1 Q4_K_M GGUF from Poolside.
-       About 75 GB on disk; currently supported by the Metal backend with
+       About 68 GB on disk; currently supported by the Metal backend with
        full model residency.
 
 Options:
@@ -192,6 +194,7 @@ case "$MODEL" in
         REPO=$LAGUNA_REPO
         MODEL_FILE=$LAGUNA_Q4_FILE
         FORCE_HF_DOWNLOAD=1
+        HF_REVISION=$LAGUNA_REVISION
         ;;
     -h|--help|help)
         usage
@@ -294,11 +297,18 @@ download_one_hf() {
 
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
+    if [ -n "$HF_REVISION" ]; then
+        echo "revision $HF_REVISION"
+    fi
     echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
-    if [ -n "$TOKEN" ]; then
+    if [ -n "$TOKEN" ] && [ -n "$HF_REVISION" ]; then
+        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+    elif [ -n "$TOKEN" ]; then
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+    elif [ -n "$HF_REVISION" ]; then
+        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$OUT_DIR"
     else
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
     fi
