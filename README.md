@@ -108,7 +108,7 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
-./download_model.sh laguna-q4  # >= 96 GB Apple Silicon, official Poolside Q4_K_M
+./download_model.sh laguna-q4  # >= 96 GB unified memory, official Poolside Q4_K_M
 ./download_model.sh laguna-q2-q3  # 64 GB class, mixed routed Q2_K/Q3_K
 ```
 
@@ -176,7 +176,7 @@ file are not supported for GLM yet.
 
 Laguna S 2.1 support targets Poolside's official imatrix-quantized Q4_K_M GGUF.
 The current 63.56 GiB recipe uses Q4_K routed experts and Q8_0 signal-path
-weights. It runs with full residency on Metal or ROCm. DwarfStar also accepts
+weights. It runs with full residency on Metal, CUDA, or ROCm. DwarfStar also accepts
 Poolside's earlier 70.01 GiB recipe with F16 attention and mixed Q4_K/Q6_K
 experts on Metal. These files fit comfortably on a 96 or 128 GiB machine.
 
@@ -184,7 +184,8 @@ For lower-memory systems, `laguna-q2-q3` downloads a 44.95 GiB mixed quant. It
 retains the official file's dense weights, uses Q2_K routed experts in layers
 1 through 20, and Q3_K routed experts in layers 21 through 47. This is the
 smaller Laguna layout and is intended for full residency on 64 GB class
-systems. On Linux, both it and the official Q4_K_M GGUF are validated on the
+systems. The current Q8_0-signal Q4_K_M and mixed Q2_K/Q3_K layouts run on
+Metal, CUDA, and ROCm. Linux validation covers NVIDIA GB10 in DGX Spark and the
 Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`) in Strix Halo.
 
 CLI, agent, and server use Laguna's native chat, interleaved reasoning, and
@@ -198,7 +199,7 @@ tagged tool-call formats:
 ```
 
 Poolside's standalone DFlash model can accelerate greedy Laguna decoding on
-Metal and ROCm without changing the generated tokens. The download target uses
+Metal, CUDA, and ROCm without changing the generated tokens. The download target uses
 a 1.04 GiB Q8_0 quant of Poolside's support model: it drafts faster and uses
 half the memory of BF16, while the full Laguna model still verifies every
 accepted token. Download it separately and pass it alongside any supported
@@ -214,7 +215,8 @@ Laguna GGUF:
   --dflash gguf/laguna-s-2.1-DFlash-Q8_0.gguf
 ```
 
-The default verifies up to three draft positions at a time and stops before
+The default explores up to 15 draft positions on CUDA and up to three on Metal
+and ROCm. It stops before
 verification when a proposal's probability is below 0.4. Use
 `--dflash-draft N` to tune the 1 through 15 range and
 `--dflash-p-min P` to tune the confidence cutoff; set the latter to `0` to
@@ -235,6 +237,27 @@ make strix-halo
 ./ds4-agent --rocm -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
 ./ds4-server --rocm -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
 ```
+
+For DGX Spark:
+
+```sh
+./download_model.sh laguna-q2-q3
+make cuda-spark
+./ds4 --cuda -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+./ds4-agent --cuda -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+./ds4-server --cuda -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf -c 8192
+```
+
+On the development DGX Spark with that mixed Q2_K/Q3_K GGUF, a 4,096-token
+prefill runs at about 580 tokens/s and generation after that prompt at about
+26.7 tokens/s. Long CUDA prefills compact routed tokens by expert, dequantize
+only active expert matrices, and use variable-size FP16 tensor-core GEMMs with
+FP32 projection outputs. Decode reuses each Laguna KV-cache row across grouped
+query heads and uses denser Q2_K/Q3_K warp layouts; short prefills retain the
+quantized matvec kernels. Set `DS4_CUDA_MOE_NO_TC_PREFILL=1` to select the
+quantized long-prefill fallback. The decode optimizations can be isolated with
+`DS4_CUDA_LAGUNA_NO_GQA_DECODE=1`, `DS4_CUDA_MOE_NO_Q2_HALFWARP=1`, and
+`DS4_CUDA_MOE_NO_Q3_GROUP_DOWN=1`.
 
 On the development Strix Halo with the official Q4_K_M GGUF, a 2,048-token
 prefill runs at about 252 tokens/s and short-context generation at about 25.8
