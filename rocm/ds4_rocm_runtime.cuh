@@ -4755,7 +4755,6 @@ static uint32_t cuda_rows_per_block_env_or_default(const char *name, uint32_t de
 struct ds4_rocm_runtime_config {
     int initialized;
     int disable_splitk_attn_out_low;
-    int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
     int shared_down_cublas;
     int graph_dump;
@@ -4770,7 +4769,6 @@ static ds4_rocm_runtime_config g_rocm_cfg;
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
-        g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
         g_rocm_cfg.shared_down_cublas = !g_quality_mode;
         g_rocm_cfg.graph_dump =
