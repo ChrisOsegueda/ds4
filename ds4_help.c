@@ -180,7 +180,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--dflash FILE", "Laguna DFlash support GGUF for greedy speculative decoding.");
-            opt(fp, c, "--dflash-draft N", "DFlash draft positions per verification batch, 1..15. Default: 3");
+            opt(fp, c, "--dflash-draft N", "Maximum DFlash draft positions per adaptive verification batch, 1..15. CUDA default: 15; other backends: 3");
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");

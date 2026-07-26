@@ -199,8 +199,8 @@ tagged tool-call formats:
 ```
 
 Poolside's standalone DFlash model can accelerate greedy Laguna decoding on
-Metal and ROCm without changing the generated tokens. Download it separately
-and pass it alongside any supported Laguna GGUF:
+Metal, CUDA, and ROCm without changing the generated tokens. Download it
+separately and pass it alongside any supported Laguna GGUF:
 
 ```sh
 ./download_model.sh laguna-dflash
@@ -212,11 +212,13 @@ and pass it alongside any supported Laguna GGUF:
   --dflash gguf/laguna-s-2.1-DFlash-BF16.gguf
 ```
 
-The default verifies three draft positions at a time. Use
-`--dflash-draft N` to tune the 1 through 15 range. DwarfStar automatically
-falls back to ordinary Laguna decoding when sampling is stochastic or when
-speculation is slower for the current turn. Set `DS4_DFLASH_TIMING=1` to print
-per-cycle draft and verify timings.
+On CUDA, DwarfStar starts with three draft positions, measures the result, and
+explores up to 15 before retaining the fastest depth. Other backends retain a
+default ceiling of three. Use `--dflash-draft N` to set the adaptive exploration
+ceiling in the 1 through 15 range. It automatically falls back to ordinary
+Laguna decoding when sampling is stochastic or when speculation is slower for
+the current turn. Set `DS4_DFLASH_TIMING=1` to print per-cycle draft and verify
+timings.
 
 For Strix Halo:
 
