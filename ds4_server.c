@@ -8472,6 +8472,7 @@ struct server {
     job *head;
     job *tail;
     job *inflight;
+    bool draining;
     bool stopping;
     int clients;
     uint64_t seq;
@@ -8489,6 +8490,7 @@ struct job {
     request req;
     bool done;
     bool cancelled;
+    bool response_committed;
     char inflight_id[48];
     time_t started_at;
     int tokens_so_far;
@@ -8516,12 +8518,38 @@ static void job_mark_cancelled(job *j) {
     pthread_mutex_unlock(&j->mu);
 }
 
+/* The client monitor and the inference worker race at the terminal response.
+ * Moving to response_committed is the one-way handoff: after it succeeds the
+ * worker owns the socket until job completion, so a normal peer close after
+ * reading the terminal bytes cannot be mistaken for abandoned generation. */
+static bool job_commit_response(job *j) {
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool committed = !j->cancelled;
+    if (committed) j->response_committed = true;
+    pthread_mutex_unlock(&j->mu);
+    return committed;
+}
+
+static bool job_cancel_if_response_uncommitted(job *j) {
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool cancelled = !j->done && !j->response_committed;
+    if (cancelled) j->cancelled = true;
+    pthread_mutex_unlock(&j->mu);
+    return cancelled;
+}
+
 /* In-flight metadata belongs to server.mu.  Keeping it out of job.mu avoids a
  * lock inversion with the scheduler: cancellation marks the job first and only
  * then enters server.mu to detach queued work. */
-static void server_register_job(server *s, job *j) {
-    if (!s || !j) return;
+static bool server_admit_job(server *s, job *j) {
+    if (!s || !j) return false;
     pthread_mutex_lock(&s->mu);
+    if (s->draining || s->stopping) {
+        pthread_mutex_unlock(&s->mu);
+        return false;
+    }
     snprintf(j->inflight_id, sizeof(j->inflight_id), "req-%llu",
              (unsigned long long)++s->inflight_seq);
     j->started_at = time(NULL);
@@ -8531,6 +8559,7 @@ static void server_register_job(server *s, job *j) {
     j->inflight_next = s->inflight;
     s->inflight = j;
     pthread_mutex_unlock(&s->mu);
+    return true;
 }
 
 static void server_unregister_job(server *s, job *j) {
@@ -8560,6 +8589,14 @@ static void server_mark_job_client_disconnected(server *s, job *j) {
     pthread_mutex_lock(&s->mu);
     j->client_connected = false;
     pthread_mutex_unlock(&s->mu);
+}
+
+static bool server_cancel_job_for_client_disconnect(server *s, job *j) {
+    if (!s || !j || !job_cancel_if_response_uncommitted(j)) return false;
+    pthread_mutex_lock(&s->mu);
+    j->client_connected = false;
+    pthread_mutex_unlock(&s->mu);
+    return true;
 }
 
 static void server_log_client_disconnect(server *s, job *j) {
@@ -11323,15 +11360,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Responses continuation state is not available; retry by replaying the full input history");
+        if (job_commit_response(j)) {
+            http_error(j->fd, s->enable_cors, 409,
+                       "Responses continuation state is not available; retry by replaying the full input history");
+        }
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
     {
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Anthropic continuation state is not available; retry by replaying the full messages history");
+        if (job_commit_response(j)) {
+            http_error(j->fd, s->enable_cors, 409,
+                       "Anthropic continuation state is not available; retry by replaying the full messages history");
+        }
         return;
     } else if (cached == 0) {
         const int rewind_to = live_prefix_rewind_target(
@@ -11530,7 +11571,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 return;
             }
             trace_event(s, trace_id, "prefill failed: %s", err);
-            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            if (job_commit_response(j)) {
+                send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            }
             return;
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
@@ -11560,7 +11603,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             return;
         }
         trace_event(s, trace_id, "prefill failed: %s", err);
-        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        if (job_commit_response(j)) {
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        }
         return;
     }
     free(disk_cache_path);
@@ -12290,7 +12335,10 @@ decode_again:
         thinking_live_clear(s, slot);
     }
 
-    bool response_ok = !job_cancelled(j);
+    /* Claim the terminal response before writing any of its bytes. The client
+     * monitor must stop treating EOF as abandoned inference at this point, but
+     * a failed terminal write below still records a real disconnect. */
+    bool response_ok = job_commit_response(j);
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
@@ -12766,12 +12814,12 @@ static bool send_models(server *s, int fd) {
 /* A dedicated endpoint keeps the OpenAI-compatible /v1/models schema stable.
  * The response is intentionally versioned because it is an operator surface,
  * not part of any client protocol. */
-static bool send_inflight(server *s, int fd) {
-    buf b = {0};
+static void append_inflight_locked(buf *b, const server *s) {
     bool first = true;
 
-    buf_puts(&b, "{\"schema\":\"ds4/inflight@1\",\"inflight\":[");
-    pthread_mutex_lock(&s->mu);
+    buf_printf(b,
+               "{\"schema\":\"ds4/inflight@1\",\"accepting_requests\":%s,\"inflight\":[",
+               (s->draining || s->stopping) ? "false" : "true");
     for (const job *j = s->inflight; j; j = j->inflight_next) {
         struct tm started_tm;
         char started_at[32];
@@ -12781,19 +12829,44 @@ static bool send_inflight(server *s, int fd) {
         {
             snprintf(started_at, sizeof(started_at), "1970-01-01T00:00:00Z");
         }
-        if (!first) buf_putc(&b, ',');
+        if (!first) buf_putc(b, ',');
         first = false;
-        buf_puts(&b, "{\"id\":");
-        json_escape(&b, j->inflight_id);
-        buf_puts(&b, ",\"started_at\":");
-        json_escape(&b, started_at);
-        buf_printf(&b,
+        buf_puts(b, "{\"id\":");
+        json_escape(b, j->inflight_id);
+        buf_puts(b, ",\"started_at\":");
+        json_escape(b, started_at);
+        buf_printf(b,
                    ",\"tokens_so_far\":%d,\"client_connected\":%s}",
                    j->tokens_so_far,
                    j->client_connected ? "true" : "false");
     }
+    buf_puts(b, "]}\n");
+}
+
+static bool send_inflight(server *s, int fd) {
+    buf b = {0};
+
+    pthread_mutex_lock(&s->mu);
+    append_inflight_locked(&b, s);
     pthread_mutex_unlock(&s->mu);
-    buf_puts(&b, "]}\n");
+
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Closing admission and taking the snapshot share server.mu with
+ * server_admit_job(). A request parsed concurrently is therefore either in
+ * this response or rejected with 503; it cannot enter between the lifecycle
+ * check and the subsequent process stop. Resume is idempotent so a failed
+ * qwen-service transition can safely reopen admission. */
+static bool send_request_admission(server *s, int fd, bool accepting) {
+    buf b = {0};
+
+    pthread_mutex_lock(&s->mu);
+    s->draining = !accepting;
+    append_inflight_locked(&b, s);
+    pthread_mutex_unlock(&s->mu);
 
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -12844,7 +12917,7 @@ static bool client_socket_disconnected(int fd) {
 /* Mark first, then detach only work that no worker owns yet. No job mutex is
  * held while entering either server scheduler mutex. */
 static void server_cancel_job(server *s, job *j) {
-    server_mark_job_client_disconnected(s, j);
+    if (!server_cancel_job_for_client_disconnect(s, j)) return;
 
     bool detached = false;
     pthread_mutex_lock(&s->mu);
@@ -12934,6 +13007,16 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/ds4/drain")) {
+        send_request_admission(s, fd, false);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/ds4/resume")) {
+        send_request_admission(s, fd, true);
+        http_request_free(&hr);
+        goto done;
+    }
     const char *model_path_prefix = "/v1/models/";
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
@@ -12989,7 +13072,13 @@ static void *client_main(void *arg) {
     j.req = req;
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
-    server_register_job(s, &j);
+    if (!server_admit_job(s, &j)) {
+        http_error(fd, s->enable_cors, 503, "server is draining");
+        pthread_cond_destroy(&j.cv);
+        pthread_mutex_destroy(&j.mu);
+        request_free(&j.req);
+        goto done;
+    }
 
     if (!enqueue(s, &j)) {
         server_unregister_job(s, &j);
@@ -17200,6 +17289,76 @@ static void test_waiting_job_cancels_on_client_close(void) {
     test_cancel_server_destroy(&s);
 }
 
+static void test_committed_response_ignores_client_close(void) {
+    server s;
+    job j;
+    int sv[2] = {-1, -1};
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        test_cancel_job_destroy(&j);
+        test_cancel_server_destroy(&s);
+        return;
+    }
+    set_client_socket_nonblocking(sv[0]);
+    j.fd = sv[0];
+
+    TEST_ASSERT(job_commit_response(&j));
+    test_cancel_wait_arg arg = {.srv = &s, .request_job = &j};
+    pthread_t waiter;
+    int thread_rc = pthread_create(&waiter, NULL, test_wait_for_disconnect_main, &arg);
+    TEST_ASSERT(thread_rc == 0);
+    if (thread_rc == 0) {
+        close(sv[1]);
+        sv[1] = -1;
+        struct timespec settle = {.tv_sec = 0, .tv_nsec = 250000000};
+        nanosleep(&settle, NULL);
+        TEST_ASSERT(!job_cancelled(&j));
+        TEST_ASSERT(!j.done);
+        job_complete(&j);
+        TEST_ASSERT(pthread_join(waiter, NULL) == 0);
+        TEST_ASSERT(!job_cancelled(&j));
+    }
+
+    close(sv[0]);
+    if (sv[1] >= 0) close(sv[1]);
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_drain_closes_request_admission(void) {
+    server s;
+    job j;
+    int sv[2] = {-1, -1};
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        test_cancel_job_destroy(&j);
+        test_cancel_server_destroy(&s);
+        return;
+    }
+
+    TEST_ASSERT(send_request_admission(&s, sv[0], false));
+    TEST_ASSERT(s.draining);
+    TEST_ASSERT(!server_admit_job(&s, &j));
+    TEST_ASSERT(j.inflight_id[0] == '\0');
+
+    TEST_ASSERT(send_request_admission(&s, sv[0], true));
+    TEST_ASSERT(!s.draining);
+    TEST_ASSERT(server_admit_job(&s, &j));
+    TEST_ASSERT(j.inflight_id[0] != '\0');
+    TEST_ASSERT(s.inflight == &j);
+    server_unregister_job(&s, &j);
+    TEST_ASSERT(s.inflight == NULL);
+
+    close(sv[0]);
+    close(sv[1]);
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
 static void test_cancel_unlinks_queued_jobs(void) {
     server s;
     job head, middle, tail;
@@ -18533,6 +18692,8 @@ static void ds4_server_unit_tests_run(void) {
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
     test_waiting_job_cancels_on_client_close();
+    test_committed_response_ignores_client_close();
+    test_drain_closes_request_admission();
     test_cancel_unlinks_queued_jobs();
     test_cancel_detaches_assigned_job();
     test_cancel_running_job_keeps_worker_ownership();
