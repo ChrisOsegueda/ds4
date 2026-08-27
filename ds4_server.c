@@ -8534,7 +8534,7 @@ static bool job_commit_response(job *j) {
 static bool job_cancel_if_response_uncommitted(job *j) {
     if (!j) return false;
     pthread_mutex_lock(&j->mu);
-    bool cancelled = !j->done && !j->response_committed;
+    bool cancelled = !j->done && !j->cancelled && !j->response_committed;
     if (cancelled) j->cancelled = true;
     pthread_mutex_unlock(&j->mu);
     return cancelled;
