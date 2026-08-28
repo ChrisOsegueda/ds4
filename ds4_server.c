@@ -10762,6 +10762,7 @@ static bool complete_tool_call_inside_thinking(const char *text, size_t len,
 
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen);
+static bool server_decode_boundary_client_alive(server *s, job *j);
 
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
@@ -12126,6 +12127,12 @@ decode_again:
             break;
         }
 
+        /* The client monitor is a fallback for prefill and scheduler waits,
+         * not the decode clock. Probe immediately before admitting backend
+         * work so a 100 ms monitor wake cannot hide several fast decode steps
+         * after FIN. */
+        if (!server_decode_boundary_client_alive(s, j)) break;
+
         int toks[17];
         int ntok = 0;
         if (!s->batched_mode &&
@@ -12153,7 +12160,11 @@ decode_again:
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
-            if (job_cancelled(j)) {
+            /* A speculative backend call can return multiple accepted tokens.
+             * Probe again before each token becomes externally accountable, so
+             * a FIN after backend admission can advance the audit frontier by
+             * at most the one token whose accounting boundary it raced. */
+            if (!server_decode_boundary_client_alive(s, j)) {
                 stop_decode = true;
                 break;
             }
@@ -13436,6 +13447,19 @@ static void server_cancel_job(server *s, job *j) {
         server_log_client_disconnect(s, j);
         job_complete(j);
     }
+}
+
+/* Decode owns a second, synchronous view of the already-consumed client
+ * socket. The monitor may probe concurrently; both paths converge through the
+ * response-uncommitted compare-and-mark under job.mu, so only the first caller
+ * changes ownership and later probes are idempotent. Once terminal response
+ * ownership is committed, server_cancel_job() deliberately refuses the mark
+ * and this boundary remains live for the worker's normal handoff. */
+static bool server_decode_boundary_client_alive(server *s, job *j) {
+    if (!s || !j || job_cancelled(j)) return false;
+    if (!client_socket_disconnected(j->fd)) return true;
+    server_cancel_job(s, j);
+    return !job_cancelled(j);
 }
 
 static void wait_for_job_or_disconnect(server *s, job *j) {
@@ -17745,6 +17769,95 @@ static void test_client_disconnect_probe(void) {
     TEST_ASSERT(!client_recv_errno_disconnected(EWOULDBLOCK));
 }
 
+static void test_cancel_job_init(job *j);
+static void test_cancel_job_destroy(job *j);
+static void test_cancel_server_init(server *s);
+static void test_cancel_server_destroy(server *s);
+
+static void test_decode_boundaries_limit_post_fin_accounting(void) {
+    server s;
+    server_slot slot = {0};
+    job during_backend, after_accounting, committed;
+    int backend_sv[2] = {-1, -1};
+    int accounting_sv[2] = {-1, -1};
+    int committed_sv[2] = {-1, -1};
+    test_cancel_server_init(&s);
+    test_server_bind_slot(&s, &slot);
+    test_cancel_job_init(&during_backend);
+    test_cancel_job_init(&after_accounting);
+    test_cancel_job_init(&committed);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, backend_sv) == 0);
+    if (backend_sv[0] >= 0 && backend_sv[1] >= 0) {
+        set_client_socket_nonblocking(backend_sv[0]);
+        during_backend.fd = backend_sv[0];
+        during_backend.client_connected = true;
+        during_backend.tokens_so_far = 40;
+        slot.running = &during_backend;
+
+        /* FIN after backend admission is observed before that result becomes
+         * accountable, so the typed audit frontier does not advance. */
+        TEST_ASSERT(server_decode_boundary_client_alive(&s, &during_backend));
+        close(backend_sv[1]);
+        backend_sv[1] = -1;
+        TEST_ASSERT(!server_decode_boundary_client_alive(&s, &during_backend));
+        TEST_ASSERT(job_cancelled(&during_backend));
+        TEST_ASSERT(!during_backend.client_connected);
+        TEST_ASSERT(during_backend.tokens_so_far == 40);
+        TEST_ASSERT(!during_backend.done);
+        TEST_ASSERT(slot.running == &during_backend);
+        TEST_ASSERT(!server_decode_boundary_client_alive(&s, &during_backend));
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, accounting_sv) == 0);
+    if (accounting_sv[0] >= 0 && accounting_sv[1] >= 0) {
+        set_client_socket_nonblocking(accounting_sv[0]);
+        after_accounting.fd = accounting_sv[0];
+        after_accounting.client_connected = true;
+        after_accounting.tokens_so_far = 40;
+        slot.running = &after_accounting;
+
+        /* The narrow opposite race is bounded to one token: FIN lands just
+         * after its accounting probe, that token commits, and the next decode
+         * admission observes the close before another backend step starts. */
+        TEST_ASSERT(server_decode_boundary_client_alive(&s, &after_accounting));
+        TEST_ASSERT(server_decode_boundary_client_alive(&s, &after_accounting));
+        close(accounting_sv[1]);
+        accounting_sv[1] = -1;
+        server_note_job_token(&s, &after_accounting);
+        TEST_ASSERT(!server_decode_boundary_client_alive(&s, &after_accounting));
+        TEST_ASSERT(job_cancelled(&after_accounting));
+        TEST_ASSERT(after_accounting.tokens_so_far == 41);
+        TEST_ASSERT(!after_accounting.done);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, committed_sv) == 0);
+    if (committed_sv[0] >= 0 && committed_sv[1] >= 0) {
+        set_client_socket_nonblocking(committed_sv[0]);
+        committed.fd = committed_sv[0];
+        committed.client_connected = true;
+        slot.running = &committed;
+        TEST_ASSERT(job_commit_response(&committed));
+        close(committed_sv[1]);
+        committed_sv[1] = -1;
+        TEST_ASSERT(server_decode_boundary_client_alive(&s, &committed));
+        TEST_ASSERT(!job_cancelled(&committed));
+        TEST_ASSERT(committed.client_connected);
+    }
+
+    slot.running = NULL;
+    if (backend_sv[0] >= 0) close(backend_sv[0]);
+    if (backend_sv[1] >= 0) close(backend_sv[1]);
+    if (accounting_sv[0] >= 0) close(accounting_sv[0]);
+    if (accounting_sv[1] >= 0) close(accounting_sv[1]);
+    if (committed_sv[0] >= 0) close(committed_sv[0]);
+    if (committed_sv[1] >= 0) close(committed_sv[1]);
+    test_cancel_job_destroy(&committed);
+    test_cancel_job_destroy(&after_accounting);
+    test_cancel_job_destroy(&during_backend);
+    test_cancel_server_destroy(&s);
+}
+
 static void test_cancel_job_init(job *j) {
     memset(j, 0, sizeof(*j));
     j->fd = -1;
@@ -19451,6 +19564,7 @@ static void ds4_server_unit_tests_run(void) {
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
+    test_decode_boundaries_limit_post_fin_accounting();
     test_cancelled_progress_callback_is_inert();
     test_waiting_job_cancels_on_client_close();
     test_committed_response_ignores_client_close();
