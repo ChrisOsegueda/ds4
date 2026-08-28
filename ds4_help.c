@@ -333,6 +333,9 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
+    opt(fp, c, "--cancellation-audit FILE", "Append content-free client-disconnect events to a private file.");
+    opt(fp, c, "--cancellation-audit-max-bytes N", "Rotate the cancellation audit before it exceeds N bytes. Default: 1048576");
+    opt(fp, c, "--cancellation-audit-generations N", "Private cancellation-audit generations, 1..16. Default: 4");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");

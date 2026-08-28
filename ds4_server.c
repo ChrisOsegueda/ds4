@@ -46,6 +46,10 @@ static volatile sig_atomic_t g_listen_fd = -1;
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 #define DS4_SERVER_DRAIN_TOKEN_HEX_LEN 64
 #define DS4_SERVER_DRAIN_MAX_AGE_SEC 600
+#define DS4_SERVER_CANCELLATION_AUDIT_DEFAULT_MAX_BYTES (1024 * 1024)
+#define DS4_SERVER_CANCELLATION_AUDIT_MAX_BYTES (16 * 1024 * 1024)
+#define DS4_SERVER_CANCELLATION_AUDIT_DEFAULT_GENERATIONS 4
+#define DS4_SERVER_CANCELLATION_AUDIT_MAX_GENERATIONS 16
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
@@ -8486,6 +8490,10 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    const char *cancellation_audit_path;
+    size_t cancellation_audit_max_bytes;
+    int cancellation_audit_generations;
+    pthread_mutex_t cancellation_audit_mu;
 };
 
 typedef struct {
@@ -8528,6 +8536,284 @@ static void server_release_stale_drain_locked(server *s) {
     memset(s->drain_token, 0, sizeof(s->drain_token));
     s->drain_owner_pid = 0;
     memset(&s->drain_acquired_at, 0, sizeof(s->drain_acquired_at));
+}
+
+typedef struct {
+    int directory_fd;
+    char basename[NAME_MAX + 1];
+} cancellation_audit_target;
+
+static void cancellation_audit_target_close(cancellation_audit_target *target) {
+    if (!target) return;
+    if (target->directory_fd >= 0) close(target->directory_fd);
+    target->directory_fd = -1;
+    memset(target->basename, 0, sizeof(target->basename));
+}
+
+static bool cancellation_audit_basename_valid(const char *basename) {
+    /* Reserve room for the largest configured generation suffix (".15"). */
+    if (!basename || !basename[0] || strlen(basename) > NAME_MAX - 3) return false;
+    if (!(isalnum((unsigned char)basename[0]))) return false;
+    for (const char *p = basename; *p; p++) {
+        if (isalnum((unsigned char)*p) || *p == '.' || *p == '_' || *p == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+/* Validate every directory component without following symlinks, then retain
+ * an fd for the private leaf directory. All later file operations are openat /
+ * renameat / unlinkat against this fd, so a path swap cannot redirect audit
+ * events after validation. */
+static bool cancellation_audit_open_target(const char *path,
+                                           cancellation_audit_target *target) {
+    size_t path_len = path ? strlen(path) : 0;
+    if (!path || !target || path_len < 4 || path[0] != '/' || path_len >= PATH_MAX ||
+        strstr(path, "//") || strstr(path, "/./") || strstr(path, "/../") ||
+        (path_len >= 2 && !strcmp(path + path_len - 2, "/.")) ||
+        (path_len >= 3 && !strcmp(path + path_len - 3, "/.."))) {
+        return false;
+    }
+
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash == path || !cancellation_audit_basename_valid(slash + 1)) {
+        return false;
+    }
+    size_t parent_len = (size_t)(slash - path);
+    char parent[PATH_MAX];
+    memcpy(parent, path, parent_len);
+    parent[parent_len] = '\0';
+
+    char component_path[PATH_MAX] = "";
+    const char *component = path + 1;
+    while ((size_t)(component - path) < parent_len) {
+        const char *end = strchr(component, '/');
+        size_t component_len = end ? (size_t)(end - component) : strlen(component);
+        size_t used = strlen(component_path);
+        if (component_len == 0 || used + component_len + 2 > sizeof(component_path)) {
+            return false;
+        }
+        component_path[used++] = '/';
+        memcpy(component_path + used, component, component_len);
+        component_path[used + component_len] = '\0';
+
+        struct stat component_stat;
+        if (lstat(component_path, &component_stat) != 0 ||
+            !S_ISDIR(component_stat.st_mode)) {
+            return false;
+        }
+        if (!end || (size_t)(end - path) >= parent_len) break;
+        component = end + 1;
+    }
+
+    struct stat parent_stat;
+    if (lstat(parent, &parent_stat) != 0 || !S_ISDIR(parent_stat.st_mode) ||
+        parent_stat.st_uid != geteuid() || (parent_stat.st_mode & 0077) != 0) {
+        return false;
+    }
+    int directory_fd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory_fd < 0) return false;
+    struct stat opened_parent_stat;
+    if (fstat(directory_fd, &opened_parent_stat) != 0 ||
+        opened_parent_stat.st_dev != parent_stat.st_dev ||
+        opened_parent_stat.st_ino != parent_stat.st_ino) {
+        close(directory_fd);
+        return false;
+    }
+
+    memset(target, 0, sizeof(*target));
+    target->directory_fd = directory_fd;
+    memcpy(target->basename, slash + 1, strlen(slash + 1) + 1);
+    return true;
+}
+
+static bool cancellation_audit_file_stat_valid(const struct stat *st) {
+    return st && S_ISREG(st->st_mode) && st->st_uid == geteuid() &&
+           (st->st_mode & 0777) == 0600 && st->st_nlink == 1;
+}
+
+static bool cancellation_audit_stat_at(int directory_fd, const char *name,
+                                       struct stat *st, bool *exists) {
+    memset(st, 0, sizeof(*st));
+    if (fstatat(directory_fd, name, st, AT_SYMLINK_NOFOLLOW) == 0) {
+        *exists = true;
+        return cancellation_audit_file_stat_valid(st);
+    }
+    if (errno == ENOENT) {
+        *exists = false;
+        return true;
+    }
+    return false;
+}
+
+static bool cancellation_audit_generation_name(char *dst, size_t dstlen,
+                                               const char *basename, int generation) {
+    int written = snprintf(dst, dstlen, "%s.%d", basename, generation);
+    return written > 0 && (size_t)written < dstlen;
+}
+
+static bool cancellation_audit_validate_generations(
+        const cancellation_audit_target *target, int generations) {
+    struct stat st;
+    bool exists = false;
+    if (!cancellation_audit_stat_at(target->directory_fd, target->basename,
+                                    &st, &exists)) {
+        return false;
+    }
+    for (int i = 1; i < generations; i++) {
+        char name[NAME_MAX + 16];
+        if (!cancellation_audit_generation_name(name, sizeof(name),
+                                                target->basename, i) ||
+            !cancellation_audit_stat_at(target->directory_fd, name, &st, &exists)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int cancellation_audit_open_current(const cancellation_audit_target *target,
+                                           bool exclusive_create) {
+    int flags = O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_CREAT;
+    if (exclusive_create) flags |= O_EXCL;
+    int fd = openat(target->directory_fd, target->basename, flags, 0600);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !cancellation_audit_file_stat_valid(&st)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Current plus generations-1 archives. Validate the complete namespace before
+ * the first rename so a hostile symlink or hardlink makes rotation fail closed
+ * without partially accepting unsafe state. */
+static bool cancellation_audit_rotate(const cancellation_audit_target *target,
+                                      int generations) {
+    if (!cancellation_audit_validate_generations(target, generations)) return false;
+
+    if (generations <= 1) {
+        if (unlinkat(target->directory_fd, target->basename, 0) != 0 && errno != ENOENT) {
+            return false;
+        }
+        int fd = cancellation_audit_open_current(target, true);
+        if (fd < 0) return false;
+        close(fd);
+        return true;
+    }
+
+    char oldest[NAME_MAX + 16];
+    if (!cancellation_audit_generation_name(oldest, sizeof(oldest),
+                                            target->basename, generations - 1)) {
+        return false;
+    }
+    if (unlinkat(target->directory_fd, oldest, 0) != 0 && errno != ENOENT) return false;
+    for (int i = generations - 2; i >= 1; i--) {
+        char source[NAME_MAX + 16];
+        char destination[NAME_MAX + 16];
+        struct stat st;
+        bool exists = false;
+        if (!cancellation_audit_generation_name(source, sizeof(source),
+                                                target->basename, i) ||
+            !cancellation_audit_generation_name(destination, sizeof(destination),
+                                                target->basename, i + 1) ||
+            !cancellation_audit_stat_at(target->directory_fd, source, &st, &exists)) {
+            return false;
+        }
+        if (exists && renameat(target->directory_fd, source,
+                               target->directory_fd, destination) != 0) {
+            return false;
+        }
+    }
+    struct stat current_stat;
+    bool current_exists = false;
+    if (!cancellation_audit_stat_at(target->directory_fd, target->basename,
+                                    &current_stat, &current_exists)) {
+        return false;
+    }
+    if (current_exists) {
+        char first[NAME_MAX + 16];
+        if (!cancellation_audit_generation_name(first, sizeof(first),
+                                                target->basename, 1) ||
+            renameat(target->directory_fd, target->basename,
+                     target->directory_fd, first) != 0) {
+            return false;
+        }
+    }
+    int fd = cancellation_audit_open_current(target, true);
+    if (fd < 0) return false;
+    close(fd);
+    return true;
+}
+
+static bool cancellation_audit_prepare(const char *path, int generations) {
+    cancellation_audit_target target = {.directory_fd = -1};
+    if (!cancellation_audit_open_target(path, &target) ||
+        !cancellation_audit_validate_generations(&target, generations)) {
+        cancellation_audit_target_close(&target);
+        return false;
+    }
+
+    struct stat st;
+    bool exists = false;
+    bool ok = cancellation_audit_stat_at(target.directory_fd, target.basename,
+                                         &st, &exists);
+    if (ok && exists && st.st_size > 0) {
+        ok = cancellation_audit_rotate(&target, generations);
+    } else if (ok && !exists) {
+        int fd = cancellation_audit_open_current(&target, true);
+        ok = fd >= 0;
+        if (fd >= 0) close(fd);
+    }
+    cancellation_audit_target_close(&target);
+    return ok;
+}
+
+static bool cancellation_audit_write(server *s, const char *request_id,
+                                     int tokens_so_far) {
+    if (!s || !s->cancellation_audit_path) return true;
+    char line[192];
+    int line_len = snprintf(
+        line, sizeof(line),
+        "ds4-server: request %s cancelled by client disconnect after %d tokens\n",
+        request_id, tokens_so_far);
+    if (line_len <= 0 || (size_t)line_len >= sizeof(line)) return false;
+
+    pthread_mutex_lock(&s->cancellation_audit_mu);
+    cancellation_audit_target target = {.directory_fd = -1};
+    bool ok = cancellation_audit_open_target(s->cancellation_audit_path, &target) &&
+              cancellation_audit_validate_generations(
+                  &target, s->cancellation_audit_generations);
+    int fd = -1;
+    if (ok) fd = cancellation_audit_open_current(&target, false);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        ok = false;
+    } else if ((size_t)st.st_size + (size_t)line_len >
+               s->cancellation_audit_max_bytes) {
+        close(fd);
+        fd = -1;
+        ok = cancellation_audit_rotate(&target, s->cancellation_audit_generations);
+        if (ok) fd = cancellation_audit_open_current(&target, false);
+        if (fd < 0) ok = false;
+    }
+    if (ok) {
+        size_t written = 0;
+        while (written < (size_t)line_len) {
+            ssize_t n = write(fd, line + written, (size_t)line_len - written);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) {
+                ok = false;
+                break;
+            }
+            written += (size_t)n;
+        }
+        if (ok && fsync(fd) != 0) ok = false;
+    }
+    if (fd >= 0) close(fd);
+    cancellation_audit_target_close(&target);
+    pthread_mutex_unlock(&s->cancellation_audit_mu);
+    return ok;
 }
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -8667,6 +8953,10 @@ static void server_log_client_disconnect(server *s, job *j) {
         server_log(DS4_LOG_GENERATION,
                    "ds4-server: request %s cancelled by client disconnect after %d tokens",
                    id, tokens_so_far);
+        if (!cancellation_audit_write(s, id, tokens_so_far)) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: cancellation audit write failed");
+        }
     }
 }
 
@@ -13349,6 +13639,9 @@ typedef struct {
     int default_tokens;
     const char *chdir_path;
     const char *trace_path;
+    const char *cancellation_audit_path;
+    int cancellation_audit_max_bytes;
+    int cancellation_audit_generations;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
@@ -13444,6 +13737,7 @@ static void server_close_resources(server *s) {
     pthread_mutex_destroy(&s->inference_mu);
     pthread_mutex_destroy(&s->model_mu);
     pthread_mutex_destroy(&s->trace_mu);
+    pthread_mutex_destroy(&s->cancellation_audit_mu);
     pthread_cond_destroy(&s->model_cv);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
@@ -13497,6 +13791,10 @@ static server_config parse_options(int argc, char **argv) {
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
+        .cancellation_audit_max_bytes =
+            DS4_SERVER_CANCELLATION_AUDIT_DEFAULT_MAX_BYTES,
+        .cancellation_audit_generations =
+            DS4_SERVER_CANCELLATION_AUDIT_DEFAULT_GENERATIONS,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -13568,6 +13866,21 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cancellation-audit")) {
+            c.cancellation_audit_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cancellation-audit-max-bytes")) {
+            c.cancellation_audit_max_bytes =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--cancellation-audit-generations")) {
+            c.cancellation_audit_generations =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.cancellation_audit_generations >
+                DS4_SERVER_CANCELLATION_AUDIT_MAX_GENERATIONS) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --cancellation-audit-generations must be <= %d",
+                           DS4_SERVER_CANCELLATION_AUDIT_MAX_GENERATIONS);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
@@ -13685,6 +13998,18 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+    if (c.cancellation_audit_path && c.cancellation_audit_max_bytes < 256) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --cancellation-audit-max-bytes must be >= 256");
+        exit(2);
+    }
+    if (c.cancellation_audit_path &&
+        c.cancellation_audit_max_bytes > DS4_SERVER_CANCELLATION_AUDIT_MAX_BYTES) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --cancellation-audit-max-bytes must be <= %d",
+                   DS4_SERVER_CANCELLATION_AUDIT_MAX_BYTES);
+        exit(2);
+    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
@@ -13729,6 +14054,13 @@ int main(int argc, char **argv) {
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
                    cfg.chdir_path, strerror(errno));
+        return 1;
+    }
+    if (cfg.cancellation_audit_path &&
+        !cancellation_audit_prepare(cfg.cancellation_audit_path,
+                                    cfg.cancellation_audit_generations)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: cancellation audit path is unsafe or unavailable");
         return 1;
     }
 
@@ -13795,6 +14127,10 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.cancellation_audit_path = cfg.cancellation_audit_path;
+    s.cancellation_audit_max_bytes =
+        (size_t)cfg.cancellation_audit_max_bytes;
+    s.cancellation_audit_generations = cfg.cancellation_audit_generations;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -13815,6 +14151,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    pthread_mutex_init(&s.cancellation_audit_mu, NULL);
 
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
@@ -14034,6 +14371,21 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+
+    TEST_ASSERT(defaults.cancellation_audit_path == NULL);
+    TEST_ASSERT(defaults.cancellation_audit_max_bytes == 1024 * 1024);
+    TEST_ASSERT(defaults.cancellation_audit_generations == 4);
+    char *audit_argv[] = {
+        "ds4-server",
+        "--cancellation-audit", "/private/tmp/ds4-cancellations.log",
+        "--cancellation-audit-max-bytes", "4096",
+        "--cancellation-audit-generations", "2",
+    };
+    server_config audit = parse_options(7, audit_argv);
+    TEST_ASSERT(!strcmp(audit.cancellation_audit_path,
+                        "/private/tmp/ds4-cancellations.log"));
+    TEST_ASSERT(audit.cancellation_audit_max_bytes == 4096);
+    TEST_ASSERT(audit.cancellation_audit_generations == 2);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -17427,9 +17779,11 @@ static void test_cancel_server_init(server *s) {
     pthread_mutex_init(&s->model_mu, NULL);
     pthread_cond_init(&s->model_cv, NULL);
     pthread_mutex_init(&s->tool_mu, NULL);
+    pthread_mutex_init(&s->cancellation_audit_mu, NULL);
 }
 
 static void test_cancel_server_destroy(server *s) {
+    pthread_mutex_destroy(&s->cancellation_audit_mu);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_cond_destroy(&s->model_cv);
     pthread_mutex_destroy(&s->model_mu);
@@ -17521,6 +17875,117 @@ static void test_committed_response_ignores_client_close(void) {
     if (sv[1] >= 0) close(sv[1]);
     test_cancel_job_destroy(&j);
     test_cancel_server_destroy(&s);
+}
+
+static bool test_read_small_file(const char *path, char *dst, size_t dstlen) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, dst, dstlen - 1);
+    bool ok = n >= 0;
+    if (ok) dst[n] = '\0';
+    close(fd);
+    return ok;
+}
+
+static void test_cancellation_audit_is_private_exact_and_rotated(void) {
+    char root_template[] = "/tmp/ds4-cancellation-audit.XXXXXX";
+    char *created_root = mkdtemp(root_template);
+    TEST_ASSERT(created_root != NULL);
+    if (!created_root) return;
+    char root[PATH_MAX];
+    char *resolved_root = realpath(created_root, root);
+    TEST_ASSERT(resolved_root != NULL);
+    if (!resolved_root) {
+        (void)rmdir(created_root);
+        return;
+    }
+
+    char audit_path[PATH_MAX];
+    char archive_path[PATH_MAX];
+    char outside_path[PATH_MAX];
+    char hardlink_path[PATH_MAX];
+    char real_dir[PATH_MAX];
+    char linked_dir[PATH_MAX];
+    char linked_audit_path[PATH_MAX];
+    snprintf(audit_path, sizeof(audit_path), "%s/cancellations.log", root);
+    snprintf(archive_path, sizeof(archive_path), "%s.1", audit_path);
+    snprintf(outside_path, sizeof(outside_path), "%s/outside.log", root);
+    snprintf(hardlink_path, sizeof(hardlink_path), "%s/hardlink.log", root);
+    snprintf(real_dir, sizeof(real_dir), "%s/real", root);
+    snprintf(linked_dir, sizeof(linked_dir), "%s/linked", root);
+    snprintf(linked_audit_path, sizeof(linked_audit_path),
+             "%s/cancellations.log", linked_dir);
+
+    TEST_ASSERT(chmod(root, 0700) == 0);
+    TEST_ASSERT(cancellation_audit_prepare(audit_path, 4));
+    struct stat audit_stat;
+    TEST_ASSERT(lstat(audit_path, &audit_stat) == 0);
+    TEST_ASSERT(cancellation_audit_file_stat_valid(&audit_stat));
+
+    server s;
+    job first;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&first);
+    s.cancellation_audit_path = audit_path;
+    s.cancellation_audit_max_bytes = 128;
+    s.cancellation_audit_generations = 4;
+    snprintf(first.inflight_id, sizeof(first.inflight_id), "req-audit-1");
+    first.client_connected = false;
+    first.tokens_so_far = 7;
+    server_log_client_disconnect(&s, &first);
+    server_log_client_disconnect(&s, &first);
+
+    char contents[512];
+    TEST_ASSERT(test_read_small_file(audit_path, contents, sizeof(contents)));
+    TEST_ASSERT(!strcmp(
+        contents,
+        "ds4-server: request req-audit-1 cancelled by client disconnect after 7 tokens\n"));
+
+    job second;
+    test_cancel_job_init(&second);
+    snprintf(second.inflight_id, sizeof(second.inflight_id), "req-audit-2");
+    second.client_connected = false;
+    second.tokens_so_far = 8;
+    server_log_client_disconnect(&s, &second);
+    TEST_ASSERT(test_read_small_file(archive_path, contents, sizeof(contents)));
+    TEST_ASSERT(!strcmp(
+        contents,
+        "ds4-server: request req-audit-1 cancelled by client disconnect after 7 tokens\n"));
+    TEST_ASSERT(test_read_small_file(audit_path, contents, sizeof(contents)));
+    TEST_ASSERT(!strcmp(
+        contents,
+        "ds4-server: request req-audit-2 cancelled by client disconnect after 8 tokens\n"));
+
+    test_cancel_job_destroy(&second);
+    test_cancel_job_destroy(&first);
+    test_cancel_server_destroy(&s);
+
+    TEST_ASSERT(unlink(audit_path) == 0);
+    int outside_fd = open(outside_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                          0600);
+    TEST_ASSERT(outside_fd >= 0);
+    if (outside_fd >= 0) close(outside_fd);
+    TEST_ASSERT(symlink(outside_path, audit_path) == 0);
+    TEST_ASSERT(!cancellation_audit_prepare(audit_path, 4));
+    TEST_ASSERT(unlink(audit_path) == 0);
+
+    int audit_fd = open(audit_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    TEST_ASSERT(audit_fd >= 0);
+    if (audit_fd >= 0) close(audit_fd);
+    TEST_ASSERT(link(audit_path, hardlink_path) == 0);
+    TEST_ASSERT(!cancellation_audit_prepare(audit_path, 4));
+
+    TEST_ASSERT(mkdir(real_dir, 0700) == 0);
+    TEST_ASSERT(symlink(real_dir, linked_dir) == 0);
+    TEST_ASSERT(!cancellation_audit_prepare(linked_audit_path, 4));
+
+    (void)unlink(linked_dir);
+    (void)rmdir(real_dir);
+    (void)unlink(hardlink_path);
+    (void)unlink(audit_path);
+    (void)unlink(outside_path);
+    (void)unlink(archive_path);
+    (void)rmdir(root);
 }
 
 static void test_drain_claim_parser_is_strict(void) {
@@ -18989,6 +19454,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancelled_progress_callback_is_inert();
     test_waiting_job_cancels_on_client_close();
     test_committed_response_ignores_client_close();
+    test_cancellation_audit_is_private_exact_and_rotated();
     test_drain_claim_parser_is_strict();
     test_drain_closes_request_admission();
     test_stale_drain_reopens_request_admission();
