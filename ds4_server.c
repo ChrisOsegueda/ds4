@@ -44,6 +44,8 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+#define DS4_SERVER_DRAIN_TOKEN_HEX_LEN 64
+#define DS4_SERVER_DRAIN_MAX_AGE_SEC 600
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
@@ -8473,6 +8475,10 @@ struct server {
     job *tail;
     job *inflight;
     bool draining;
+    bool drain_claim_valid;
+    char drain_token[DS4_SERVER_DRAIN_TOKEN_HEX_LEN + 1];
+    pid_t drain_owner_pid;
+    struct timespec drain_acquired_at;
     bool stopping;
     int clients;
     uint64_t seq;
@@ -8481,6 +8487,48 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+typedef struct {
+    char token[DS4_SERVER_DRAIN_TOKEN_HEX_LEN + 1];
+    pid_t owner_pid;
+} drain_claim;
+
+static bool drain_token_equal(const char *left, const char *right) {
+    unsigned int difference = 0;
+    for (size_t i = 0; i < DS4_SERVER_DRAIN_TOKEN_HEX_LEN + 1; i++) {
+        difference |= (unsigned char)left[i] ^ (unsigned char)right[i];
+    }
+    return difference == 0;
+}
+
+static bool drain_owner_alive(pid_t owner_pid) {
+    if (owner_pid <= 0) return false;
+    if (kill(owner_pid, 0) == 0) return true;
+    return errno == EPERM;
+}
+
+/* A lifecycle process owns admission only while it can finish or unwind its
+ * transition. Owner death releases the boundary immediately on the next
+ * operator/admission request. The bounded age is a second recovery boundary
+ * for PID reuse or a wedged owner; qwen-service times out its stop well before
+ * this lease expires. Call only while holding server.mu. */
+static void server_release_stale_drain_locked(server *s) {
+    if (!s->draining || !s->drain_claim_valid) return;
+
+    struct timespec now = {0};
+    bool expired = false;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        time_t age = now.tv_sec - s->drain_acquired_at.tv_sec;
+        expired = age < 0 || age >= DS4_SERVER_DRAIN_MAX_AGE_SEC;
+    }
+    if (drain_owner_alive(s->drain_owner_pid) && !expired) return;
+
+    s->draining = false;
+    s->drain_claim_valid = false;
+    memset(s->drain_token, 0, sizeof(s->drain_token));
+    s->drain_owner_pid = 0;
+    memset(&s->drain_acquired_at, 0, sizeof(s->drain_acquired_at));
+}
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
  * completion after it has written the response, so request data and the socket
@@ -8546,6 +8594,7 @@ static bool job_cancel_if_response_uncommitted(job *j) {
 static bool server_admit_job(server *s, job *j) {
     if (!s || !j) return false;
     pthread_mutex_lock(&s->mu);
+    server_release_stale_drain_locked(s);
     if (s->draining || s->stopping) {
         pthread_mutex_unlock(&s->mu);
         return false;
@@ -12814,9 +12863,10 @@ static bool send_models(server *s, int fd) {
 /* A dedicated endpoint keeps the OpenAI-compatible /v1/models schema stable.
  * The response is intentionally versioned because it is an operator surface,
  * not part of any client protocol. */
-static void append_inflight_locked(buf *b, const server *s) {
+static void append_inflight_locked(buf *b, server *s) {
     bool first = true;
 
+    server_release_stale_drain_locked(s);
     buf_printf(b,
                "{\"schema\":\"ds4/inflight@1\",\"accepting_requests\":%s,\"inflight\":[",
                (s->draining || s->stopping) ? "false" : "true");
@@ -12855,20 +12905,156 @@ static bool send_inflight(server *s, int fd) {
     return ok;
 }
 
+static bool json_positive_pid(const char **p, pid_t *out) {
+    json_ws(p);
+    if (**p < '1' || **p > '9') return false;
+
+    uint64_t value = 0;
+    while (**p >= '0' && **p <= '9') {
+        unsigned int digit = (unsigned int)(**p - '0');
+        if (value > ((uint64_t)INT_MAX - digit) / 10) return false;
+        value = value * 10 + digit;
+        (*p)++;
+    }
+    *out = (pid_t)value;
+    return true;
+}
+
+static bool drain_token_valid(const char *token) {
+    if (!token || strlen(token) != DS4_SERVER_DRAIN_TOKEN_HEX_LEN) return false;
+    for (size_t i = 0; i < DS4_SERVER_DRAIN_TOKEN_HEX_LEN; i++) {
+        char c = token[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+/* Operator admission requests are intentionally stricter than inference JSON:
+ * exactly one transition_token and owner_pid are accepted, with no aliases,
+ * duplicate keys, unknown fields, fractional numbers, or trailing data. */
+static bool parse_drain_claim(const char *body, size_t body_len, drain_claim *claim) {
+    if (!body || !claim || strlen(body) != body_len) return false;
+
+    drain_claim parsed = {0};
+    bool saw_token = false;
+    bool saw_owner = false;
+    const char *p = body;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    if (*p == '}') return false;
+
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+
+        bool field_ok = false;
+        if (!strcmp(key, "transition_token") && !saw_token) {
+            char *token = NULL;
+            field_ok = json_string(&p, &token) && drain_token_valid(token);
+            if (field_ok) {
+                memcpy(parsed.token, token, sizeof(parsed.token));
+                saw_token = true;
+            }
+            free(token);
+        } else if (!strcmp(key, "owner_pid") && !saw_owner) {
+            field_ok = json_positive_pid(&p, &parsed.owner_pid);
+            if (field_ok) saw_owner = true;
+        }
+        free(key);
+        if (!field_ok) return false;
+
+        json_ws(&p);
+        if (*p == '}') {
+            p++;
+            break;
+        }
+        if (*p != ',') return false;
+        p++;
+    }
+    json_ws(&p);
+    if (*p != '\0' || !saw_token || !saw_owner) return false;
+
+    *claim = parsed;
+    return true;
+}
+
+static bool drain_claim_matches_locked(const server *s, const drain_claim *claim) {
+    return s->drain_claim_valid && s->drain_owner_pid == claim->owner_pid &&
+           drain_token_equal(s->drain_token, claim->token);
+}
+
+typedef enum {
+    REQUEST_ADMISSION_CHANGED,
+    REQUEST_ADMISSION_CONFLICT,
+    REQUEST_ADMISSION_CLOCK_ERROR,
+} request_admission_result;
+
+static request_admission_result server_set_request_admission_locked(
+        server *s, bool accepting, const drain_claim *claim) {
+    server_release_stale_drain_locked(s);
+
+    if (!accepting) {
+        if (s->draining && !drain_claim_matches_locked(s, claim)) {
+            return REQUEST_ADMISSION_CONFLICT;
+        }
+        if (!s->draining) {
+            memcpy(s->drain_token, claim->token, sizeof(s->drain_token));
+            s->drain_owner_pid = claim->owner_pid;
+            s->drain_claim_valid = true;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &s->drain_acquired_at) != 0) {
+            if (!s->draining) {
+                s->drain_claim_valid = false;
+                memset(s->drain_token, 0, sizeof(s->drain_token));
+                s->drain_owner_pid = 0;
+            }
+            return REQUEST_ADMISSION_CLOCK_ERROR;
+        }
+        s->draining = true;
+        return REQUEST_ADMISSION_CHANGED;
+    }
+
+    if (!drain_claim_matches_locked(s, claim)) {
+        return REQUEST_ADMISSION_CONFLICT;
+    }
+    s->draining = false;
+    return REQUEST_ADMISSION_CHANGED;
+}
+
 /* Closing admission and taking the snapshot share server.mu with
  * server_admit_job(). A request parsed concurrently is therefore either in
  * this response or rejected with 503; it cannot enter between the lifecycle
- * check and the subsequent process stop. Resume is idempotent so a failed
- * qwen-service transition can safely reopen admission. */
-static bool send_request_admission(server *s, int fd, bool accepting) {
+ * check and the subsequent process stop. The caller-generated capability
+ * makes drain/resume idempotent only for the lifecycle transition that owns
+ * the boundary, including recovery from a lost HTTP response. */
+static bool send_request_admission(server *s, int fd, bool accepting,
+                                   const drain_claim *claim) {
     buf b = {0};
 
     pthread_mutex_lock(&s->mu);
-    s->draining = !accepting;
-    append_inflight_locked(&b, s);
+    request_admission_result result =
+        server_set_request_admission_locked(s, accepting, claim);
+    if (result == REQUEST_ADMISSION_CHANGED) append_inflight_locked(&b, s);
     pthread_mutex_unlock(&s->mu);
 
-    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    bool ok;
+    if (result == REQUEST_ADMISSION_CONFLICT) {
+        ok = http_error(fd, s->enable_cors, 409,
+                        "request admission is owned by another transition");
+    } else if (result == REQUEST_ADMISSION_CLOCK_ERROR) {
+        ok = http_error(fd, s->enable_cors, 500,
+                        "request admission clock unavailable");
+    } else {
+        ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    }
     buf_free(&b);
     return ok;
 }
@@ -13008,12 +13194,22 @@ static void *client_main(void *arg) {
         goto done;
     }
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/ds4/drain")) {
-        send_request_admission(s, fd, false);
+        drain_claim claim = {0};
+        if (!parse_drain_claim(hr.body, hr.body_len, &claim)) {
+            http_error(fd, s->enable_cors, 400, "invalid request admission claim");
+        } else {
+            send_request_admission(s, fd, false, &claim);
+        }
         http_request_free(&hr);
         goto done;
     }
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/ds4/resume")) {
-        send_request_admission(s, fd, true);
+        drain_claim claim = {0};
+        if (!parse_drain_claim(hr.body, hr.body_len, &claim)) {
+            http_error(fd, s->enable_cors, 400, "invalid request admission claim");
+        } else {
+            send_request_admission(s, fd, true, &claim);
+        }
         http_request_free(&hr);
         goto done;
     }
@@ -17327,25 +17523,79 @@ static void test_committed_response_ignores_client_close(void) {
     test_cancel_server_destroy(&s);
 }
 
+static void test_drain_claim_parser_is_strict(void) {
+    static const char token[] =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    char body[160];
+    drain_claim claim = {0};
+    int n = snprintf(body, sizeof(body),
+                     "{\"transition_token\":\"%s\",\"owner_pid\":%d}",
+                     token, (int)getpid());
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(body));
+    TEST_ASSERT(parse_drain_claim(body, strlen(body), &claim));
+    TEST_ASSERT(!strcmp(claim.token, token));
+    TEST_ASSERT(claim.owner_pid == getpid());
+
+    TEST_ASSERT(!parse_drain_claim("{}", 2, &claim));
+    TEST_ASSERT(!parse_drain_claim(
+        "{\"transition_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"owner_pid\":1,\"extra\":true}",
+        strlen("{\"transition_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"owner_pid\":1,\"extra\":true}"),
+        &claim));
+    TEST_ASSERT(!parse_drain_claim(
+        "{\"transition_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF\",\"owner_pid\":1}",
+        strlen("{\"transition_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF\",\"owner_pid\":1}"),
+        &claim));
+    TEST_ASSERT(!parse_drain_claim(
+        "{\"transition_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"owner_pid\":1.5}",
+        strlen("{\"transition_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"owner_pid\":1.5}"),
+        &claim));
+}
+
 static void test_drain_closes_request_admission(void) {
     server s;
     job j;
-    int sv[2] = {-1, -1};
     test_cancel_server_init(&s);
     test_cancel_job_init(&j);
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) {
-        test_cancel_job_destroy(&j);
-        test_cancel_server_destroy(&s);
-        return;
-    }
+    drain_claim owner = {
+        .token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .owner_pid = 1,
+    };
+    drain_claim conflicting_token = {
+        .token = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .owner_pid = 1,
+    };
+    drain_claim conflicting_owner = {
+        .token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .owner_pid = 2,
+    };
 
-    TEST_ASSERT(send_request_admission(&s, sv[0], false));
+    owner.owner_pid = getpid();
+    conflicting_token.owner_pid = getpid();
+    conflicting_owner.owner_pid = getpid() == INT_MAX ? getpid() - 1 : getpid() + 1;
+
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(server_set_request_admission_locked(&s, false, &owner) ==
+                REQUEST_ADMISSION_CHANGED);
+    TEST_ASSERT(server_set_request_admission_locked(&s, false, &owner) ==
+                REQUEST_ADMISSION_CHANGED);
+    TEST_ASSERT(server_set_request_admission_locked(&s, false, &conflicting_token) ==
+                REQUEST_ADMISSION_CONFLICT);
+    TEST_ASSERT(server_set_request_admission_locked(&s, true, &conflicting_token) ==
+                REQUEST_ADMISSION_CONFLICT);
+    TEST_ASSERT(server_set_request_admission_locked(&s, true, &conflicting_owner) ==
+                REQUEST_ADMISSION_CONFLICT);
+    pthread_mutex_unlock(&s.mu);
+
     TEST_ASSERT(s.draining);
     TEST_ASSERT(!server_admit_job(&s, &j));
     TEST_ASSERT(j.inflight_id[0] == '\0');
 
-    TEST_ASSERT(send_request_admission(&s, sv[0], true));
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(server_set_request_admission_locked(&s, true, &owner) ==
+                REQUEST_ADMISSION_CHANGED);
+    TEST_ASSERT(server_set_request_admission_locked(&s, true, &owner) ==
+                REQUEST_ADMISSION_CHANGED);
+    pthread_mutex_unlock(&s.mu);
     TEST_ASSERT(!s.draining);
     TEST_ASSERT(server_admit_job(&s, &j));
     TEST_ASSERT(j.inflight_id[0] != '\0');
@@ -17353,8 +17603,54 @@ static void test_drain_closes_request_admission(void) {
     server_unregister_job(&s, &j);
     TEST_ASSERT(s.inflight == NULL);
 
-    close(sv[0]);
-    close(sv[1]);
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_stale_drain_reopens_request_admission(void) {
+    server s;
+    job j;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    drain_claim owner = {
+        .token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .owner_pid = getpid(),
+    };
+
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(server_set_request_admission_locked(&s, false, &owner) ==
+                REQUEST_ADMISSION_CHANGED);
+    s.drain_acquired_at.tv_sec -= DS4_SERVER_DRAIN_MAX_AGE_SEC;
+    pthread_mutex_unlock(&s.mu);
+
+    TEST_ASSERT(server_admit_job(&s, &j));
+    TEST_ASSERT(!s.draining);
+    TEST_ASSERT(!s.drain_claim_valid);
+    server_unregister_job(&s, &j);
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_dead_drain_owner_reopens_request_admission(void) {
+    server s;
+    job j;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    drain_claim owner = {
+        .token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .owner_pid = getpid(),
+    };
+
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(server_set_request_admission_locked(&s, false, &owner) ==
+                REQUEST_ADMISSION_CHANGED);
+    s.drain_owner_pid = INT_MAX;
+    pthread_mutex_unlock(&s.mu);
+
+    TEST_ASSERT(server_admit_job(&s, &j));
+    TEST_ASSERT(!s.draining);
+    TEST_ASSERT(!s.drain_claim_valid);
+    server_unregister_job(&s, &j);
     test_cancel_job_destroy(&j);
     test_cancel_server_destroy(&s);
 }
@@ -18693,7 +18989,10 @@ static void ds4_server_unit_tests_run(void) {
     test_cancelled_progress_callback_is_inert();
     test_waiting_job_cancels_on_client_close();
     test_committed_response_ignores_client_close();
+    test_drain_claim_parser_is_strict();
     test_drain_closes_request_admission();
+    test_stale_drain_reopens_request_admission();
+    test_dead_drain_owner_reopens_request_admission();
     test_cancel_unlinks_queued_jobs();
     test_cancel_detaches_assigned_job();
     test_cancel_running_job_keeps_worker_ownership();
