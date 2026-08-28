@@ -4757,6 +4757,83 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
     }
 }
 
+typedef struct {
+    bool requested;
+    int completed_tokens;
+    double requested_at;
+} test_prefill_cancel_state;
+
+static void test_prefill_cancel_display_progress(
+        void *ud, const char *event, int current, int total) {
+    (void)total;
+    test_prefill_cancel_state *state = ud;
+    if (!state || strcmp(event, "prefill_display") || current <= 0) return;
+    state->completed_tokens = current;
+    if (!state->requested) {
+        state->requested = true;
+        state->requested_at = now_sec();
+    }
+}
+
+static bool test_prefill_cancel_requested(void *ud) {
+    test_prefill_cancel_state *state = ud;
+    return state && state->requested;
+}
+
+/* Real backend coverage for the server cancellation contract.  A roughly
+ * 60k-token prompt enters canonical layer-major prefill.  Display progress is
+ * emitted only after a backend layer command buffer completes, so arming the
+ * ordinary session callback there verifies that the next admission boundary
+ * interrupts the request without publishing a partial checkpoint. */
+static void test_long_prefill_cancel_boundary(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 65536) == 0);
+    if (!session) return;
+
+    ds4_tokens prompt = {0};
+    const int token = ds4_token_eos(engine);
+    for (int i = 0; i < 60000; i++) ds4_tokens_push(&prompt, token);
+
+    test_prefill_cancel_state state = {0};
+    ds4_session_set_display_progress(session,
+                                     test_prefill_cancel_display_progress,
+                                     &state);
+    ds4_session_set_cancel(session, test_prefill_cancel_requested, &state);
+    char err[160] = "";
+    const int rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+    const double cancellation_latency = state.requested_at == 0.0 ?
+        DBL_MAX : now_sec() - state.requested_at;
+
+    TEST_ASSERT(state.requested);
+    TEST_ASSERT(state.completed_tokens > 0);
+    TEST_ASSERT(rc == DS4_SESSION_SYNC_INTERRUPTED);
+    TEST_ASSERT(!strcmp(err, "interrupted"));
+    TEST_ASSERT(cancellation_latency < 2.0);
+    TEST_ASSERT(ds4_session_pos(session) == 0);
+
+    /* The partial per-layer KV/compressor state must never be reused.  A fresh
+     * request on the same session resets it and completes normally. */
+    ds4_session_set_cancel(session, NULL, NULL);
+    ds4_session_set_display_progress(session, NULL, NULL);
+    ds4_tokens retry = {0};
+    ds4_tokens_push(&retry, token);
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(ds4_session_sync(session, &retry, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(session) == 1);
+
+    fprintf(stderr,
+            "ds4-test: 60k prefill cancellation observed after layer progress "
+            "%d and returned in %.3f ms\n",
+            state.completed_tokens,
+            cancellation_latency * 1000.0);
+    ds4_tokens_free(&retry);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(session);
+}
+
 static void test_long_story_fact_recall(void) {
     const char *prompt_path = getenv("DS4_TEST_LONG_PROMPT");
     if (!prompt_path || !prompt_path[0]) {
@@ -6422,6 +6499,7 @@ typedef struct {
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
+    {"--prefill-cancel-boundary", "prefill-cancel-boundary", "60k real-backend prefill cancellation latency and partial-session invalidation", test_long_prefill_cancel_boundary},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},

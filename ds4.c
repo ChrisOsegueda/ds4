@@ -34428,7 +34428,7 @@ static bool metal_graph_prefill_pipeline_stage_major(
     return ok;
 }
 
-static bool metal_graph_prefill_layer_major(
+static bool metal_graph_prefill_layer_major_cancellable(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -34439,10 +34439,18 @@ static bool metal_graph_prefill_layer_major(
         bool                   show_progress,
         ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
-        void                  *display_progress_ud) {
+        void                  *display_progress_ud,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
+    if (cancelled) *cancelled = false;
+    if (cancel && cancel(cancel_ud)) {
+        if (cancelled) *cancelled = true;
+        return true;
+    }
 
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
@@ -34476,7 +34484,12 @@ static bool metal_graph_prefill_layer_major(
      * cosmetic.
      */
     const bool throttle = graph_power_throttle_enabled(g);
-    const bool callback_split = display_progress != NULL && n_tokens >= 32;
+    /* TP ranks must cross identical per-layer gates.  Its worker-side session
+     * does not share the frontend callback, so keep TP on the existing mirrored
+     * chunk boundary until cancellation is transported to both ranks. */
+    const bool layer_cancel_boundary = cancel != NULL && g->tp_world < 2;
+    const bool callback_split =
+        (display_progress != NULL || layer_cancel_boundary) && n_tokens >= 32;
     const bool split_commands = g->ssd_streaming ||
                                 split_profile || throttle || callback_split ||
                                 n_tokens > 2048 || imatrix != NULL;
@@ -35013,6 +35026,29 @@ static bool metal_graph_prefill_layer_major(
             fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
             fflush(stderr);
         }
+        /*
+         * Long layer-major prefill used to observe cancellation only after an
+         * entire multi-thousand-token chunk had crossed every model layer.
+         * Each split layer command buffer is already a backend synchronization
+         * boundary.  Observe the request callback here, after the command has
+         * completed and before the next layer or output head is admitted.
+         *
+         * A partial layer-major chunk is not a reusable KV/compressor frontier;
+         * the session owner invalidates it before returning to the server.  We
+         * therefore deliberately do not publish chunk progress from this path.
+         */
+        if (layer_cancel_boundary && cancel(cancel_ud)) {
+#ifdef DS4_ROCM_BUILD
+            (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
+            (void)ds4_gpu_stream_expert_cache_release_layer_cache();
+#endif
+            if (layer_prepare) {
+                (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
+                                                          layer_prepare_ahead);
+            }
+            if (cancelled) *cancelled = true;
+            return true;
+        }
     }
     if (!ok) {
 #ifdef DS4_ROCM_BUILD
@@ -35129,6 +35165,34 @@ static bool metal_graph_prefill_layer_major(
                 (t_read - t0) * 1000.0);
     }
     return ok;
+}
+
+static bool metal_graph_prefill_layer_major(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_imatrix_collector *imatrix,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud) {
+    return metal_graph_prefill_layer_major_cancellable(g,
+                                                       model,
+                                                       weights,
+                                                       prompt,
+                                                       start,
+                                                       n_tokens,
+                                                       logits,
+                                                       show_progress,
+                                                       imatrix,
+                                                       display_progress,
+                                                       display_progress_ud,
+                                                       NULL,
+                                                       NULL,
+                                                       NULL);
 }
 
 static bool metal_graph_prefill_raw_swa(
@@ -35270,22 +35334,31 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
-        bool ok = metal_graph_prefill_layer_major(g,
-                                                  model,
-                                                  weights,
-                                                  prompt,
-                                                  pos0,
-                                                  chunk,
-                                                  chunk_logits,
-                                                  show_progress,
-                                                  imatrix,
-                                                  display_progress,
-                                                  display_progress_ud);
+        bool layer_cancelled = false;
+        bool ok = metal_graph_prefill_layer_major_cancellable(
+                g,
+                model,
+                weights,
+                prompt,
+                pos0,
+                chunk,
+                chunk_logits,
+                show_progress,
+                imatrix,
+                display_progress,
+                display_progress_ud,
+                cancel,
+                cancel_ud,
+                &layer_cancelled);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
             }
             return false;
+        }
+        if (layer_cancelled) {
+            if (cancelled) *cancelled = true;
+            return true;
         }
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
@@ -60798,8 +60871,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                                         &cancelled);
             if (cancelled) {
                 snprintf(err, errlen, "interrupted");
-                s->checkpoint_valid = true;
-                s->mtp_draft_valid = false;
+                /* A cancellation may have arrived after only some layers of
+                 * the next chunk completed.  No partial KV/compressor state is
+                 * a valid replay frontier, even though the prior token prefix
+                 * was complete, so the next request must rebuild from reset. */
+                ds4_session_invalidate(s);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             if (!ok) {
@@ -60864,8 +60940,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                          &cancelled);
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
-            s->checkpoint_valid = s->checkpoint.len > 0;
-            s->mtp_draft_valid = false;
+            /* See the resumed-prefill path above: layer-boundary cancellation
+             * abandons the whole live backend frontier by design. */
+            ds4_session_invalidate(s);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
     } else {
